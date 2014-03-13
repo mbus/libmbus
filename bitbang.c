@@ -111,6 +111,19 @@ void MBus_send(uint8_t* buf, int length, uint8_t is_priority) {
 	tx_buf = buf;
 	tx_length = length;
 	tx_priority = is_priority;
+
+	if (state == IDLE) {
+		// It is safe to directly change logical model and drive DOUT
+		// here. The state changes to PREARB at the falling edge of
+		// clock the half-period before arbitration resolution
+		logical = TRANSMIT;
+		SET_DOUT_LOW();
+	} else {
+		// TODO: Handle TX request when bus is busy better. We could
+		// probably check this status at the end of the current
+		// transaction? Currently we just immediately fail.
+		mbus->MBus_send_done(0);
+	}
 }
 
 void MBus_CLKIN_int_handler(int CLKIN_val) {
@@ -235,6 +248,8 @@ void MBus_CLKIN_int_handler(int CLKIN_val) {
 						rx_buf_len = &mbus->recv_buf_1_len;
 						rx_buf = mbus->recv_buf_1;
 						memcpy(rx_buf, &rx_addr, 1);
+					} else {
+						// TODO: Assert interrupt
 					}
 					rx_byte_idx = 1;
 					rx_bit_idx = 0;
