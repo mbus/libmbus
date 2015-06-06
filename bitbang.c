@@ -1,6 +1,7 @@
 #include "bitbang.h"
 
 #include <string.h>
+#include <stdbool.h>
 
 struct MBus_t* mbus;
 
@@ -10,6 +11,8 @@ static volatile enum MBus_state_t {
 	ARBITRATION,
 	PRIO_DRIVE,
 	PRIO_LATCH,
+	ARB_RESERVED_DRIVE,
+	ARB_RESERVED_LATCH,
 	DRIVE_SHORT_ADDR,
 	LATCH_SHORT_ADDR,
 	DRIVE_LONG_ADDR,
@@ -38,11 +41,11 @@ static volatile enum MBus_logical_t {
 	INTERRUPTER,
 } logical = FORWARD;
 
-static volatile uint8_t last_clkin = 1;
-static volatile uint8_t last_din = 1;
-static volatile uint8_t last_dout = 1;
-static volatile uint8_t interrupt_count = 0;
-static volatile enum MBus_error_t error = MBUS_NO_ERROR;
+static volatile bool last_clkin = 1;
+static volatile bool last_din = 1;
+static volatile bool last_dout = 1;
+static volatile unsigned interrupt_count = 0;
+static volatile enum MBus_error_t error = MBUS_ERR_NO_ERROR;
 
 static          uint8_t *tx_buf = NULL;
 static          int      tx_length = 0;
@@ -54,13 +57,14 @@ static volatile uint32_t rx_addr = 0;
 static volatile uint8_t  rx_bit_idx = 0;
 static volatile int      rx_byte_idx = 0;
 static          int      rx_buf_zero = 0;
+static volatile unsigned rx_buf_idx;
 static volatile int*     rx_buf_len = &rx_buf_zero;
 static volatile uint8_t* rx_buf = NULL;
 
 static volatile uint8_t  ack = 0;
 
 
-static inline void SET_CLKOUT_TO(uint8_t val) {
+static inline void SET_CLKOUT_TO(bool val) {
 	mbus->set_gpio_val(mbus->CLKOUT_gpio, val);
 }
 static inline void SET_CLKOUT_HIGH(void) {
@@ -70,7 +74,7 @@ static inline void SET_CLKOUT_LOW(void) {
 	SET_CLKOUT_TO(0);
 }
 
-static inline void SET_DOUT_TO(uint8_t val) {
+static inline void SET_DOUT_TO(bool val) {
 	mbus->set_gpio_val(mbus->DOUT_gpio, val);
 }
 static inline void SET_DOUT_HIGH(void) {
@@ -90,7 +94,7 @@ void MBus_init(struct MBus_t *m) {
 	last_din = 1;
 	last_dout = 1;
 	interrupt_count = 0;
-	error = MBUS_NO_ERROR;
+	error = MBUS_ERR_NO_ERROR;
 
 	tx_buf = NULL;
 	tx_length = 0;
@@ -122,7 +126,7 @@ void MBus_send(uint8_t* buf, int length, uint8_t is_priority) {
 		// TODO: Handle TX request when bus is busy better. We could
 		// probably check this status at the end of the current
 		// transaction? Currently we just immediately fail.
-		mbus->MBus_send_done(0);
+		mbus->MBus_send_done(0, MBUS_ERR_BUS_BUSY);
 	}
 }
 
@@ -130,7 +134,7 @@ void MBus_CLKIN_int_handler(int CLKIN_val) {
 	if (last_clkin == CLKIN_val) {
 		if (state == ERROR) return;
 		state = ERROR;
-		error = MBUS_CLOCK_SYNCH_ERROR;
+		error = MBUS_ERR_CLOCK_SYNCH_ERROR;
 		return;
 	}
 	last_clkin = CLKIN_val;
@@ -178,7 +182,7 @@ void MBus_CLKIN_int_handler(int CLKIN_val) {
 			break;
 
 		case PRIO_LATCH:
-			state = DRIVE_SHORT_ADDR;
+			state = ARB_RESERVED_DRIVE;
 			if (logical == TRANSMIT) {
 				if (tx_priority) {
 					// NOP, won prio arbitration
@@ -203,7 +207,16 @@ void MBus_CLKIN_int_handler(int CLKIN_val) {
 				}
 			}
 
+			// Beginning of data array is address, jump to sending
 			if (logical == TRANSMIT) state = DRIVE_DATA;
+			break;
+
+		case ARB_RESERVED_DRIVE:
+			state = ARB_RESERVED_LATCH;
+			break;
+
+		case ARB_RESERVED_LATCH:
+			state = DRIVE_SHORT_ADDR;
 			break;
 
 		// ADDR states only used in FWD/RX mode
@@ -229,9 +242,11 @@ void MBus_CLKIN_int_handler(int CLKIN_val) {
 					logical = FORWARD;
 				}
 			} else if (rx_bit_idx == 8) {
+				// Short address finished. If long address,
+				// already jumped to *_LONG_ADDR states.
 				state = DRIVE_DATA;
 				if (logical == RECEIVE_BROADCAST) {
-					char channel = rx_addr & 0xf;
+					unsigned channel = rx_addr & 0xf;
 					if (mbus->broadcast_channels &
 							(1 << channel)) {
 						logical = RECEIVE;
@@ -240,18 +255,20 @@ void MBus_CLKIN_int_handler(int CLKIN_val) {
 					}
 				}
 				if (logical == RECEIVE) {
-					if (mbus->recv_buf_0_len >= 1) {
-						rx_buf_len = &mbus->recv_buf_0_len;
-						rx_buf = mbus->recv_buf_0;
-						memcpy(rx_buf, &rx_addr, 1);
-					} else if (mbus->recv_buf_1_len >= 1) {
-						rx_buf_len = &mbus->recv_buf_1_len;
-						rx_buf = mbus->recv_buf_1;
-						memcpy(rx_buf, &rx_addr, 1);
-					} else {
-						// TODO: Assert interrupt
+					for (rx_buf_idx=0; rx_buf_idx < RX_BUFFER_COUNT; rx_buf_idx++) {
+						if (mbus->recv_buffer_lengths[rx_buf_idx] > 0) {
+							rx_buf_len = &mbus->recv_buffer_lengths[rx_buf_idx];
+							rx_buf = mbus->recv_buffers[rx_buf_idx];
+							break;
+						}
 					}
-					rx_byte_idx = 1;
+					if (rx_buf == NULL) {
+						// No available rx buffers
+						state = REQUEST_INTERRUPT;
+						error = MBUS_ERR_RECV_OVERFLOW;
+						break;
+					}
+					mbus->recv_addrs[rx_buf_idx] = (rx_addr << 24);
 					rx_bit_idx = 0;
 				}
 			}
@@ -288,16 +305,20 @@ void MBus_CLKIN_int_handler(int CLKIN_val) {
 					}
 				}
 				if (logical == RECEIVE) {
-					if (mbus->recv_buf_0_len >= 4) {
-						rx_buf_len = &mbus->recv_buf_0_len;
-						rx_buf = mbus->recv_buf_0;
-						memcpy(rx_buf, &rx_addr, 4);
-					} else if (mbus->recv_buf_1_len >= 4) {
-						rx_buf_len = &mbus->recv_buf_1_len;
-						rx_buf = mbus->recv_buf_1;
-						memcpy(rx_buf, &rx_addr, 4);
+					for (rx_buf_idx=0; rx_buf_idx < RX_BUFFER_COUNT; rx_buf_idx++) {
+						if (mbus->recv_buffer_lengths[rx_buf_idx] > 0) {
+							rx_buf_len = &mbus->recv_buffer_lengths[rx_buf_idx];
+							rx_buf = mbus->recv_buffers[rx_buf_idx];
+							break;
+						}
 					}
-					rx_byte_idx = 4;
+					if (rx_buf == NULL) {
+						// No available rx buffers
+						state = REQUEST_INTERRUPT;
+						error = MBUS_ERR_RECV_OVERFLOW;
+						break;
+					}
+					mbus->recv_addrs[rx_buf_idx] = rx_addr;
 					rx_bit_idx = 0;
 				}
 			}
@@ -319,11 +340,21 @@ void MBus_CLKIN_int_handler(int CLKIN_val) {
 
 		case LATCH_DATA:
 			state = DRIVE_DATA;
+			if (logical == TRANSMIT) {
+				if (tx_byte_idx == tx_length) {
+					state = REQUEST_INTERRUPT;
+					error = MBUS_ERR_NO_ERROR;
+				}
+			}
 			if (logical == RECEIVE) {
+				// n.b. This logic will reject messages of
+				// exactly the buffer length if we're before
+				// the sender in the ring (it doesn't wait
+				// until 2 bits in to trigger overflow)
 				if (rx_byte_idx > *rx_buf_len) {
 					state = REQUEST_INTERRUPT;
 					logical = TRANSMIT;
-					error = MBUS_RECV_OVERFLOW;
+					error = MBUS_ERR_RECV_OVERFLOW;
 					break;
 				}
 				rx_buf[rx_byte_idx] |= last_din << rx_bit_idx;
@@ -331,12 +362,6 @@ void MBus_CLKIN_int_handler(int CLKIN_val) {
 				if (rx_bit_idx == 8) {
 					rx_bit_idx = 0;
 					rx_byte_idx++;
-				}
-			}
-			if (logical == TRANSMIT) {
-				if (tx_byte_idx == tx_length) {
-					state = REQUEST_INTERRUPT;
-					error = MBUS_NO_ERROR;
 				}
 			}
 			break;
@@ -362,7 +387,7 @@ void MBus_CLKIN_int_handler(int CLKIN_val) {
 		case DRIVE_CB0:
 			state = LATCH_CB0;
 			if (logical == INTERRUPTER) {
-				if (error == MBUS_NO_ERROR) {
+				if (error == MBUS_ERR_NO_ERROR) {
 					SET_DOUT_HIGH(); // EoM;
 				} else {
 					SET_DOUT_LOW(); // !EoM;
@@ -376,7 +401,7 @@ void MBus_CLKIN_int_handler(int CLKIN_val) {
 			if (logical == RECEIVE) {
 				// Swtich to TX mode to send CB1
 				logical = TRANSMIT;
-			} else if (error == MBUS_NO_ERROR) {
+			} else if (error == MBUS_ERR_NO_ERROR) {
 				logical = FORWARD;
 			}
 			break;
@@ -384,7 +409,7 @@ void MBus_CLKIN_int_handler(int CLKIN_val) {
 		case DRIVE_CB1:
 			state = LATCH_CB1;
 			if (logical == INTERRUPTER) {
-				if (error == MBUS_RECV_OVERFLOW) {
+				if (error == MBUS_ERR_RECV_OVERFLOW) {
 					SET_DOUT_HIGH(); // Tx/Rx Error
 				}
 			} else if (logical == TRANSMIT) {
@@ -431,13 +456,13 @@ void MBus_CLKIN_int_handler(int CLKIN_val) {
 	}
 
 	if (state == BEGIN_IDLE) {
-		if (error != MBUS_NO_ERROR) {
+		if (error != MBUS_ERR_NO_ERROR) {
 			mbus->MBus_error(error);
 		} else if (tx_byte_idx > 0) {
-			mbus->MBus_send_done(tx_byte_idx);
+			mbus->MBus_send_done(tx_byte_idx, error);
 		} else if (rx_byte_idx > 0) {
 			*rx_buf_len = -rx_byte_idx;
-			mbus->MBus_recv(rx_buf_len == &mbus->recv_buf_1_len);
+			mbus->MBus_recv(rx_buf_idx);
 		}
 	}
 }
@@ -446,7 +471,7 @@ void MBus_DIN_int_handler(int DIN_val) {
 	if (last_din == DIN_val) {
 		if (state == ERROR) return;
 		state = ERROR;
-		error = MBUS_DATA_SYNCH_ERROR;
+		error = MBUS_ERR_DATA_SYNCH_ERROR;
 		return;
 	}
 	last_din = DIN_val;

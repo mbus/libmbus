@@ -2,6 +2,7 @@
 #define BITBANG_H
 
 #include <stdint.h>
+#include <stdbool.h>
 
 /* This file is written to be architecture and platform independent. To
  * facilitate this, we define a simple, standard interface to the required
@@ -27,6 +28,9 @@
  *   to a configuration structure (struct MBus_t). This structure must remain
  *   valid forever. It is safe to modify reasonable things (e.g. the send done
  *   callback when no send is in progress) during runtime.
+ *   Platforms must also call MBus_DIN_int_handler and MBus_CLKIN_int_handler
+ *   whenever the DIN and CLKIN gpios change. These functions are designed to
+ *   be called from within an interrupt context, and may call set_gpio_val.
  *
  *   MBus_send will arbitrate for the bus and then write an array of bytes
  *   directly onto the wires (that is, the address must be included as the
@@ -46,27 +50,32 @@
  *   client may do anything with the buffer. To mark a buffer as valid again,
  *   the client simply sets the length to a positive value.
  *   If no buffers are available when a message is addressed to this library,
- *   MBus will Interrupt and NAK the message sender.
+ *   it will interject the transmission and NAK the message sender indicating
+ *   an RX Overflow.
  *   Upon receipt of a whole message, MBus_recv callback is called. This
  *   function should be treated as an interrupt and perform minimal processing.
  */
 
+/* This controls the number of RX buffer pointers. For most applications the
+ * default value (2) is a good choice. */
+#define RX_BUFFER_COUNT 2
+_Static_assert(RX_BUFFER_COUNT > 0, "Must have at least one RX buffer slot");
+
 enum MBus_error_t {
-	MBUS_NO_ERROR,
-	MBUS_CLOCK_SYNCH_ERROR,
-	MBUS_DATA_SYNCH_ERROR,
-	MBUS_RECV_OVERFLOW,
-	MBUS_INTERRUPTED,
+	MBUS_ERR_NO_ERROR,
+	MBUS_ERR_BUS_BUSY,
+	MBUS_ERR_CLOCK_SYNCH_ERROR,
+	MBUS_ERR_DATA_SYNCH_ERROR,
+	MBUS_ERR_RECV_OVERFLOW,
+	MBUS_ERR_INTERRUPTED,
 };
 
 struct MBus_t {
-	int CLKIN_gpio;      // GPIO pin index assigned to CLKIN
-	int CLKOUT_gpio;     // GPIO pin index assigned to CLKOUT
-	int DIN_gpio;        // GPIO pin index assigned to DIN
-	int DOUT_gpio;       // GPIO pin index assigned to DOUT
+	unsigned CLKOUT_gpio;     // GPIO pin index assigned to CLKOUT
+	unsigned DOUT_gpio;       // GPIO pin index assigned to DOUT
 
-	// Boolean. Set false if only listening on the bus
-	uint8_t participate_in_enumeration;
+	// Boolean. Set false if only listening (snooping) on the bus
+	bool participate_in_enumeration;
 
 	// Bit Vector. Broadcast channels to subscribe to.
 	uint16_t broadcast_channels;
@@ -80,26 +89,42 @@ struct MBus_t {
 	// bottom four bits of this value are signficant.
 	uint8_t short_prefix;
 	// Full prefix. Only the bottom 6 bytes of this value are significant.
-	//   _Note:_ The most-significant byte is reserved and should be 0.
+	//   _Note:_ The most-significant of the significant bytes (byte 6) is
+	//   currently reserved by the MBus specification and should be 0.
 	uint32_t full_prefix;
 
-	void (*set_gpio_val)(int gpio_idx, int is_high);
+	// Function that sets a specified gpio (one of CLKOUT_gpio or DOUT_gpio)
+	// to a specified value
+	void (*set_gpio_val)(unsigned gpio_idx, bool gpio_val);
 
-	void (*MBus_send_done)(int bytes_sent);
+	// Callback when MBus_send completes.
+	// May be called from within an interrupt handler.
+	void (*MBus_send_done)(int bytes_sent, enum MBus_error_t);
 
-	volatile uint8_t* recv_buf_0; // Valid iff recv_buf_0_len > 0
-	volatile int recv_buf_0_len;
-	volatile uint8_t* recv_buf_1; // Valid iff recv_buf_1_len > 0
-	volatile int recv_buf_1_len;
-	void (*MBus_recv)(int recv_buf_idx); // Will be 0 or 1
+	// Callback when a message is received
+	// May be called from within an interrupt handler.
+	void (*MBus_recv)(unsigned recv_buf_idx); // idx in [0, RX_BUFFER_COUNT)
 
+	// Callback when an error occurs
+	// May be called from within an interrupt handler.
 	void (*MBus_error)(enum MBus_error_t);
+
+	// Note these must be last so that the offset of remaining structure
+	// elements are not affected by changing RX_BUFFER_COUNT
+	//
+	// recv_buffers[idx] is considered available for writing up to
+	// recv_buffer_lengths[idx] bytes if recv_buffer_lengths[idx] > 0.
+	// Short prefixes occupy bits [31..24] of recv_addrs[idx].
+	volatile int recv_buffer_lengths[RX_BUFFER_COUNT];
+	volatile uint32_t recv_addrs[RX_BUFFER_COUNT];
+	volatile uint8_t* recv_buffers[RX_BUFFER_COUNT];
 };
 
 void MBus_init(struct MBus_t *); // Pointer must remain valid forever
 void MBus_run(void);
 void MBus_send(uint8_t* buf, int length, uint8_t is_priority);
-  // buf pointer must reamin valid until send_done is called
+  // buf pointer must reamin valid until MBus_send_done is called
+  // MBus_send_done may be called from this function (e.g. if MBUS_ERR_BUS_BUSY)
 
 void MBus_DIN_int_handler(int DIN_val);
 void MBus_CLKIN_int_handler(int CLKIN_val);
