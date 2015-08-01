@@ -1,8 +1,8 @@
 CFLAGS = -Wall -Wextra -g
 
-all:	bitbang.o
+all:	libmbus.o
 
-bitbang.o:	bitbang.c bitbang.h
+libmbus.o:	libmbus.c libmbus.h
 
 clean:
-	rm -f bitbang.o
+	rm -f libmbus.o

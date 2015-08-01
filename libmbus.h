@@ -1,5 +1,5 @@
-#ifndef BITBANG_H
-#define BITBANG_H
+#ifndef LIBMBUS_H
+#define LIBMBUS_H
 
 #include <stdint.h>
 #include <stdbool.h>
@@ -129,4 +129,4 @@ void MBus_send(uint8_t* buf, int length, uint8_t is_priority);
 void MBus_DIN_int_handler(int DIN_val);
 void MBus_CLKIN_int_handler(int CLKIN_val);
 
-#endif // BITBANG_H
+#endif // LIBMBUS_H
